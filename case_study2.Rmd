@@ -1,0 +1,211 @@
+---
+title: "case_study2"
+author: "Ben Aoki-Sherwood"
+date: "2022-11-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(bayesrules)
+library(bayesplot)
+library(runjags)
+library(tidyverse)
+library(coda)
+library(extraDistr)
+set.seed(987654321)
+```
+
+```{r}
+#load data
+radon <- read.csv("https://aloy.rbind.io/data/radon.csv")
+head(radon)
+```
+
+I will run a hierarchical MCMC simulation using JAGS to estimate the county-level means $\mu_j$, the state-level mean $\mu$, the between-country variatiance $\tau$, and the within-county variance $\sigma$ of log-radon concentrations in Minnesota. The JAGS model specification is below.
+
+```{r}
+# load glm JAGS module 
+rjags::load.module("glm")
+# set up the model to be used in JAGS
+modelString <-"
+model {
+## sampling
+for (i in 1:N){
+   y[i] ~ dnorm(mu_j[counties[i]], invsigma2)
+}
+
+## priors
+for (j in 1:J){
+   mu_j[j] ~ dnorm(mu, invtau2)
+}
+invsigma2 ~ dgamma(a_s, b_s)
+sigma <- sqrt(pow(invsigma2, -1))
+
+## hyperpriors
+mu ~ dnorm(mu0, g0)
+invtau2 ~ dscaled.gamma(s, df)
+tau <- sqrt(pow(invtau2, -1))
+
+## prediction
+for (i in 1:N) {
+  ypred[i] ~ dnorm(mu_j[counties[i]], invsigma2)
+}
+}
+"
+y <- radon$log.radon     
+counties <- radon$county      
+N <- length(y)  
+J <- length(unique(counties)) 
+the_data <- list("y" = y, "counties" = counties, 
+                 "N" = N, "J" = J,
+                 "mu0" = 0, "g0" = 5, # noninformative flat normal prior on mu
+                 "s" = 25, "df" = 1,   # noninformative half-Cauchy prior on precision suggested by Gelman
+                 "a_s" = 0.01, "b_s" = 0.01)
+
+#set reproducible and distinct initial values
+inits <- list(
+  list(mu = rnorm(1, 0, 2),
+       invsigma2 = rgamma(1, 0.01, 0.01), 
+       invtau2 = rhcauchy(1, 25), .RNG.seed = 987654321, .RNG.name = "base::Mersenne-Twister"),
+  list(mu = rnorm(1, 0, 2),
+       invsigma2 = rgamma(1, 0.01, 0.01), 
+       invtau2 = rhcauchy(1, 25), .RNG.seed = 987651234567894321, .RNG.name = "base::Mersenne-Twister"),
+  list(mu = rnorm(1, 0, 2),
+       invsigma2 = rgamma(1, 0.01, 0.01), 
+       invtau2 = rhcauchy(1, 25), .RNG.seed = 8912345, .RNG.name = "base::Mersenne-Twister"))
+```
+
+Next, I will run JAGS with the model specified above.
+
+```{r}
+posterior <- run.jags(modelString,
+                      n.chains = 3,
+                      data = the_data,
+                      monitor = c("mu", "tau", "mu_j", "sigma"),
+                      inits = inits,
+                      adapt = 1000,
+                      burnin = 5000,
+                      sample = 5000,
+                      silent.jags = TRUE)
+post_pred <- run.jags(modelString,
+                      n.chains = 1,
+                      data = the_data,
+                      monitor = c("ypred"),
+                      adapt = 1000,
+                      burnin = 5000,
+                      sample = 500,
+                      silent.jags = TRUE)
+```
+
+To ensure that the JAGS MCMC simulation converged, I will calculate Gelman-Rubin diagnostics,
+
+```{r}
+gelman.diag(posterior)
+```
+
+Geweke diagnostics,
+
+```{r}
+geweke.diag(posterior)
+```
+
+and the effective sample size,
+
+```{r}
+effectiveSize(posterior)
+```
+
+for each parameter of the model.
+
+### Model Checking:
+
+All of these diagnostics indicate that my sampler was efficient and that it converged, so I will perform a posterior predictive check to make sure that the model fits the data.
+
+```{r}
+# NOTE: this chunk takes a while to run
+ppc_dens_overlay(y = radon$log.radon, yrep = post_pred$mcmc[[1]])
+```
+
+The overall distribution of log radon concentrations appears to align with the observed distribution, although their skews are slightly different. I will perform a ppc on skew to make sure there is no systematic difference in skew between the posterior of each mean and the sample skew.
+
+```{r}
+# NOTE: These plots do not render properly unless zoomed in on in RStudio, because there are too many
+library(moments)
+ppc_stat_grouped(y = radon$log.radon, # observed y
+  yrep = post_pred$mcmc[[1]], # simulated y
+  group = radon$county, # grouping factor
+  stat = "skewness" # function name
+)
+```
+
+Also, it looks like the observed skewness in log radon levels for each county could have reasonably been generated from the posterior predictive distribution of the skewness in log radon levels for each county, so I would say that the model fits the data sufficiently well. I picked the skewness as a test statistic because it is orthogonal to the mean, which parameterizes the Normal likelihood of my model. 
+
+### Results
+
+```{r}
+post_df <- data.frame(posterior$mcmc[[1]])  %>%
+  rename_with(function(colname) {str_replace(colname, 'mu_j\\.([0-9]+)\\.', 'mu_\\1')})
+```
+
+Based on the simulated conditional posterior distributions, I estimate that there is a 90% probability that the state-wide average radon concentration is between 3.37 and 3.97 pCi/L and the between-county variance in radon levels is between 1.27 and 1.50 pCi^2/L^2. The distributions for these parameters are centered (median) around 3.66 pCi/L and 1.37 pCi^2/L^2, respectively. 
+
+```{r}
+quantile(exp(post_df$mu), c(0.05, 0.95))
+quantile(exp(post_df$tau), c(0.05, 0.95))
+median(exp(post_df$mu))
+median(exp(post_df$tau))
+```
+
+A table showing the median log-radon concentrations for each of the MN counties represented in the dataset is generated in the code chunk below.
+
+```{r}
+# function to map mu_i column names to the names of the corresponding counties
+interval_lb_95 <- function(x) {
+  quantile(x, 0.025)
+}
+
+interval_ub_95 <- function(x) {
+  quantile(x, 0.975)
+}
+
+radon_counties <- post_df %>%
+  select(-c("mu", "sigma", "tau")) %>%
+  summarize_all(median) %>%
+  summarize_all(exp) %>%
+  pivot_longer(cols = everything(), names_to = "county", values_to = "radon.level") %>%
+  mutate(county = as.integer(str_extract(county, '[0-9]+'))) %>%
+  left_join(radon %>% select(c("county", "county.name")), by = "county") %>%
+  group_by(county.name, radon.level) %>%
+  summarize(county.name = first(county.name), radon.level = first(radon.level))
+
+radon_counties %>% knitr::kable()
+```
+
+To identify counties with unusually high log radon concentrations, I will take the medians of the posterior distributions of $\mu$, $\mu_j$, and $\tau$ as point estimates, then determine which $\mu_j$s are more than 1 standard deviations above $\mu$. I tried using 2 SDs, but all counties were within 2 SDs of the mean.
+
+```{r}
+threshold <- median(exp(post_df$mu)) + 1 * sqrt(exp(median(post_df$tau)))
+high_radon_counties <- radon_counties %>% 
+  filter(radon.level >= threshold) 
+```
+
+I will visualize the levels for these counties relative to the rest. The gap between them and the rest of the counties confirms that this is a reasonable partition of counties by radon levels.
+
+```{r}
+library(ggrepel)
+ggplot(data=radon_counties, aes(x = radon.level, y = 0, label = county.name)) +
+  geom_point() +
+  geom_label_repel(data = subset(radon_counties, radon.level > threshold),
+                   box.padding   = 0.35, 
+                   point.padding = 1,
+                   segment.color = 'grey50',
+                   max.overlaps = 100) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.title.y = element_blank()) +
+  labs(x = "Estimated Average Radon Level (pCi/L)",
+       title = "Counties with High Radon Levels in Minnesota")
+```
+
+
+
+

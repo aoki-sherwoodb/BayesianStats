@@ -1,0 +1,134 @@
+---
+title: "case_study1"
+author: "Ben Aoki-Sherwood"
+date: "2022-10-23"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(bayesrules)
+library(runjags)
+library(tidyverse)
+set.seed(987654321)
+```
+
+```{r}
+#load data
+scores <- read.csv("http://aloy.rbind.io/data/test_scores.csv")
+head(scores)
+```
+
+To estimate the mean $\mu$ and standard deviation $\sigma$ of the exam scores, I will run a multiparameter MCMC simulation using JAGS. I assume that the population of these exam scores is normally distributed with mean $\mu$ and standard deviation $\sigma$. To reflect my lack of information about the standard deviation, I will use the weak prior Gamma(0.1, 0.1) for the precision $\phi = 1/\sigma^2$. In addition, based on my prior beliefs, I would say that the distribution of possible mean test scores should be about 85, with values above 95 and below 75 being very unlikely. Thus I will use the prior N(85, 3.3). 
+
+I will leave the initial values of the parameters empty, allowing JAGS to fill them.
+
+```{r}
+# set up the model to be used in JAGS
+modelString = "
+model{
+## sampling
+for (i in 1:n) {
+   y[i] ~ dnorm(mu, phi)
+}
+## priors
+mu ~ dnorm(mu0, phi0)
+phi ~ dgamma(a, b)
+sigma <- sqrt(pow(phi, -1))
+}
+"
+# define the variables used in this model
+y <- scores$score
+n <- length(y)
+data <- list("y" = y,
+          "n" = n,
+          "a" = 0.1,
+          "b" = 0.1,
+          "mu0" = 85,
+          "phi0" = 1/3.3^2)
+# set the RNG for reproducibility
+inits <- list(.RNG.seed = 987654321, .RNG.name = "base::Mersenne-Twister")
+```
+
+Next, I will run JAGS with the model specified above.
+
+```{r}
+posterior <- run.jags(
+  modelString,
+  n.chains = 1,
+  data = data,
+  monitor = c("mu", "phi", "sigma"),
+  adapt = 1000,
+  burnin = 5000,
+  sample = 5000,
+  inits = inits,
+  silent.jags = TRUE
+)
+```
+
+To ensure that the JAGS MCMC simulation converged, I need to examine convergence diagnostic plots for both $\mu$:
+
+```{r}
+plot(posterior, vars = "mu")
+```
+
+...and $\sigma$:
+
+```{r}
+plot(posterior, vars = "sigma")
+```
+
+and I observe that the ACF drops off steeply for both variables, and that the trace plots look like white noise around a stable center, without plateaus or long-term trends. So, I conclude that this MCMC simulation converged on a stationary distribution, which I can take to be my posterior distribution for this model. To answer the inference questions posed in this case study, I will examine the summary statistics of the distributions of $\mu$ and $\sigma$, taking their means to be my estimates of the parameter values.
+
+```{r}
+summary(posterior)
+```
+
+Based on these means, I estimate that $\mu = 86.81$ and $\sigma = 8.99$.
+
+Now, to predict the score for a randomly selected future Stat 120 student, I need to first simulate the posterior predictive distributions by making repeated draws of $\mu$ and $\sigma$ from my simulated conditional posteriors, then drawing from the likelihood conditioned on these parameter draws, ie $Y_i \text{~} N(\mu_i, \sigma_i)$. 
+
+```{r}
+posterior_conditionals <- data.frame(posterior$mcmc[[1]])
+
+# simulate the posterior predictive distribution for scores and for medians
+# of samples of size 29
+S <- 10000
+post_pred <- rep(0, S)
+post_pred_med <- rep(0, S)
+for (i in 1:S) {
+  # draw mu and sigma from their simulated conditional posteriors
+  mu_i <- sample(posterior_conditionals$mu, 1)
+  sigma_i <- sample(posterior_conditionals$sigma, 1)
+  
+  # draw from the likelihood conditioned on those values of mu and sigma
+  # NOTE: because test scores cannot be higher than 100, I will cap these draws 
+  #       at 100 by converting any draw larger than 100 down to 100.
+  post_pred[i] <- min(rnorm(1, mu_i, sigma_i), 100)
+  post_pred_med[i] <- median(rnorm(29, mu_i, sigma_i))
+}
+```
+
+To ensure that my model could have generated the data and thus is accurate, I will perform a posterior predictive check using the posterior predictive distribution of medians. In the plot generated below, the median is shown as a solid black line, and it is right in the middle of the distribution: there is a high probability that this could have been sample drawn from my posterior. Thus this model is appropriate.
+
+```{r}
+ggplot(data=NULL) +
+  geom_histogram((aes(x=post_pred_med))) +
+  geom_vline(xintercept=median(scores$score)) +
+  labs(x="Median Score", y="Probability", title="Median Posterior Predictive Check")
+```
+
+With the simulated posterior predictive distribution of scores in hand, I will actually make a prediction by calculating a 90% prediction interval:
+
+```{r}
+quantile(post_pred, c(0.05, 0.95))
+```
+
+thus predicting that there is a 90% probability that the Exam I score of a randomly selected future Stat 120 student is between 71.80 and 100.00.
+
+```{r}
+ggplot(data=NULL) +
+  geom_histogram(aes(x=post_pred, y=..count../sum(..count..))) +
+  labs(x="Predicted Score", y="Probability", title="Predicted Exam I Scores for a Future Stat 120 Student")
+```
+
